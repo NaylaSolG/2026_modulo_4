@@ -31,7 +31,7 @@ conceptos fundamentales de Machine Learning:
 - Métodos no supervisados
 
   - PCA
-  
+
   - MCA
 
   - Clustering
@@ -134,3 +134,11 @@ fit, evaluación)
 
 ------------------------------------------------------------------------
 
+### Material de años anteriores
+
+Si estás buscando el material de años anteriores, se pueden descargar
+desde los siguientes links:  
+-2022  
+[<img src="img/Download.png" width="50px">](2022.zip)  
+-2024  
+[<img src="img/Download.png" width="50px">](2024.zip)
