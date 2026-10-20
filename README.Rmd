@@ -11,7 +11,7 @@ output:
 ##### Universidad Nacional de San Martín
 ![](img/logo-factor-data-solo.jpg){width='200px'}  
 **Coordinación:**  
--[Germán Rosati](https://x.com/FactorData)    
+- [Germán Rosati](https://x.com/FactorData)    
 
 **Equipo Docente:**  
  - [Santiago Bezchinsky](https://www.linkedin.com/in/santiago-bezchinsky/) | [Github](https://github.com/tizan25)    

@@ -6,7 +6,7 @@
 
 <img src="img/logo-factor-data-solo.jpg" width="200" />  
 **Coordinación:**  
--[Germán Rosati](https://x.com/FactorData)
+- [Germán Rosati](https://x.com/FactorData)
 
 **Equipo Docente:**  
 - [Santiago

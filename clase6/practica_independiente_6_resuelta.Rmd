@@ -1,0 +1,312 @@
+---
+title: "Clase 6 - Redes Neuronales Artificiales"
+subtitle: "Práctica independiente - resolución"
+author: 
+  - Diplomatura en Ciencias Sociales Computacionales y Humanidades Digitales (IDAES-UNSAM)
+  - Módulo 4 - Fundamentos de Machine Learning
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float:
+      toc_collapsed: false
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(nnet)
+```
+
+## Los datos
+
+```{r}
+datos <- readRDS("./data/desgaste_salud.RDS")
+
+datos <- datos %>% 
+  mutate(desgaste = factor(if_else(desgaste == "No", "No", "Si"),
+                           levels = c("No", "Si")))
+
+table(datos$desgaste)
+prop.table(table(datos$desgaste))
+```
+
+## 1. Exploración previa
+
+```{r}
+tibble(
+  variable = names(datos),
+  tipo     = sapply(datos, class),
+  valores  = sapply(datos, function(x) length(unique(x)))
+) %>% 
+  arrange(valores) %>% 
+  head(10)
+```
+
+Las variables constantes son `cant_empleados` (siempre 1), `mas_18` (siempre "Y") y `horas_estandar` (siempre 80).
+
+Conviene sacarlas por dos motivos. Por un lado, no aportan información. Por otro, `step_normalize()` divide por el desvío estándar, y el desvío de una variable constante es cero: el resultado es una columna de `NaN` y el ajuste de la red falla.
+
+```{r}
+# cuántas categorías tienen las variables de texto
+datos %>% 
+  select(where(is.character)) %>% 
+  summarise(across(everything(), n_distinct)) %>% 
+  pivot_longer(everything(), names_to = "variable", values_to = "categorias")
+```
+
+## 2. Partición
+
+```{r}
+set.seed(1912)
+
+split <- initial_split(datos, strata = desgaste)
+train <- training(split)
+test  <- testing(split)
+
+table(train$desgaste)
+table(test$desgaste)
+```
+
+## 3. La receta
+
+```{r}
+receta_red <- recipe(desgaste ~ ., data = train) %>%
+  update_role(ID, new_role = "id") %>%
+  step_zv(all_predictors()) %>%                          # variables constantes
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(desgaste)                                   # casos sintéticos de la clase minoritaria
+
+horneada <- bake(prep(receta_red), new_data = NULL)
+
+cat("Predictoras tras la receta:", ncol(horneada) - 2, "\n")
+cat("Filas tras el SMOTE:", nrow(horneada), "\n")
+table(horneada$desgaste)
+```
+
+Quedaron 37 predictoras a partir de las 30 originales (27 sin contar las constantes), y SMOTE balanceó las clases agregando casos sintéticos de la clase minoritaria, en lugar de eliminar casos de la mayoritaria como hace `step_downsample()`.
+
+## 4. El modelo
+
+```{r}
+red_spec <- mlp(hidden_units = 8, penalty = 0.05, epochs = 300) %>%
+  set_engine("nnet", trace = FALSE) %>%
+  set_mode("classification")
+```
+
+Con 37 predictoras y 8 neuronas, la red tiene $(37 \times 8) + 8 + 8 + 1 = 313$ pesos. Es menos que el límite por defecto de `MaxNWts` (1000), así que no hace falta cambiarlo. Con 16 neuronas serían 625, y con 32 ya superaríamos el límite.
+
+## 5. Ajuste y evaluación
+
+```{r}
+set.seed(1912)
+
+red_fit <- workflow() %>% 
+  add_recipe(receta_red) %>% 
+  add_model(red_spec) %>% 
+  fit(train)
+
+pred_red <- augment(red_fit, test)
+```
+
+```{r}
+metricas <- metric_set(accuracy, precision, recall, f_meas)
+
+metricas(pred_red, truth = desgaste, estimate = .pred_class, event_level = "second")
+```
+
+```{r}
+roc_auc(pred_red, truth = desgaste, .pred_Si, event_level = "second")
+```
+
+```{r}
+conf_mat(pred_red, truth = desgaste, estimate = .pred_class)
+```
+
+## 6. La comparación
+
+El random forest no necesita dummies ni normalización, pero `step_smote()` calcula distancias entre casos y necesita que todas las variables sean numéricas. Por eso, si usamos SMOTE, las dummies son necesarias igual.
+
+Lo más simple, y además lo que permite comparar en igualdad de condiciones, es usar la misma receta para todos los modelos. La normalización no afecta al random forest: los cortes de un árbol no cambian si se reescala una variable.
+
+```{r}
+evaluar <- function(nombre, spec, rec = receta_red) {
+  set.seed(1912)
+  fit <- workflow() %>% add_recipe(rec) %>% add_model(spec) %>% fit(train)
+  p   <- augment(fit, test)
+  bind_rows(
+    metricas(p, truth = desgaste, estimate = .pred_class, event_level = "second"),
+    roc_auc(p, truth = desgaste, .pred_Si, event_level = "second")
+  ) %>% 
+    select(.metric, .estimate) %>% 
+    mutate(modelo = nombre)
+}
+
+comparacion <- bind_rows(
+  evaluar("Red neuronal (8 neuronas)",
+          mlp(hidden_units = 8, penalty = 0.05, epochs = 300) %>% 
+            set_engine("nnet", trace = FALSE) %>% set_mode("classification")),
+  evaluar("Red neuronal (16 neuronas)",
+          mlp(hidden_units = 16, penalty = 0.05, epochs = 300) %>% 
+            set_engine("nnet", trace = FALSE, MaxNWts = 5000) %>% set_mode("classification")),
+  evaluar("Random Forest (500)",
+          rand_forest(trees = 500) %>% 
+            set_engine("ranger", seed = 1912) %>% set_mode("classification")),
+  evaluar("Árbol de decisión",
+          decision_tree(tree_depth = 6, min_n = 20) %>% 
+            set_engine("rpart") %>% set_mode("classification"))
+)
+
+comparacion %>% 
+  pivot_wider(names_from = .metric, values_from = .estimate) %>% 
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+```
+
+## 7. Las preguntas
+
+**¿Qué modelo elegimos?**
+
+Depende de la métrica. En esta corrida, con los hiperparámetros elegidos a mano, el random forest tiene mejor *accuracy*, *precision* y ROC AUC, mientras que la red de 8 neuronas tiene un recall más alto (0,68 contra 0,58).
+
+En términos del problema, el random forest es más conservador: cuando predice desgaste suele acertar, pero no detecta muchos de los casos reales. La red detecta más casos de desgaste, a costa de más falsos positivos.
+
+Cuando ajustamos los hiperparámetros de la red con cross-validation (sección 8), la situación cambia: la red llega a un ROC AUC de 0,93 y a un recall de 0,76, por encima del random forest en las dos métricas. Para que la comparación sea justa, habría que ajustar también los hiperparámetros del random forest.
+
+**¿Qué error es más costoso?**
+
+Si el modelo se usara para asignar acciones de prevención (una entrevista, un cambio de turno, acompañamiento), un falso negativo, es decir, no detectar a alguien que efectivamente está por dejar el puesto, probablemente sea más costoso que un falso positivo, que implica una intervención de más. Con ese criterio, la red sería preferible aunque su *accuracy* sea menor.
+
+Qué métrica priorizar depende del problema y del uso que se le va a dar al modelo. Esa decisión no es solo técnica: también depende de quienes lo van a usar.
+
+**¿Por qué acá la red compite mejor que en la ENUT?**
+
+En la ENUT, ninguna versión de la red superó al random forest. Acá, una vez ajustada, queda a la par o por encima. Algunas hipótesis posibles:
+
+- Esta base tiene 30 predictoras (37 columnas después de las dummies), contra 9 en la ENUT. Con más variables hay más combinaciones posibles entre ellas, y la red puede aprovecharlas.
+- Muchas variables son escalas ordinales (satisfacción de 1 a 4, involucramiento de 1 a 4). Los árboles las usan con cortes por umbral, mientras que la red puede combinarlas de forma gradual.
+
+De todas formas, con 1.676 casos las diferencias entre modelos pueden deberse al azar de la partición. Para afirmar que un modelo es mejor que otro habría que compararlos con cross-validation sobre los mismos folds, y no con un único train/test.
+
+## 8. Extras
+
+### Tuneo con cross-validation
+
+```{r}
+red_tune <- mlp(hidden_units = tune(), penalty = tune(), epochs = 300) %>%
+  set_engine("nnet", trace = FALSE, MaxNWts = 5000) %>%
+  set_mode("classification")
+
+grilla <- grid_regular(
+  hidden_units(range = c(2, 16)),
+  penalty(range = c(-3, 0)),
+  levels = 3
+)
+
+set.seed(111)
+folds <- vfold_cv(train, v = 5, strata = desgaste)
+
+set.seed(345)
+red_rs <- workflow() %>% 
+  add_recipe(receta_red) %>% 
+  add_model(red_tune) %>% 
+  tune_grid(
+    resamples = folds,
+    grid      = grilla,
+    metrics   = metric_set(roc_auc, recall)
+  )
+
+show_best(red_rs, metric = "roc_auc", n = 5)
+```
+
+```{r}
+autoplot(red_rs)
+```
+
+```{r}
+mejor <- select_best(red_rs, metric = "roc_auc")
+
+fit_final <- finalize_workflow(
+  workflow() %>% add_recipe(receta_red) %>% add_model(red_tune),
+  mejor
+) %>% fit(train)
+
+pred_final <- augment(fit_final, test)
+
+bind_rows(
+  metricas(pred_final, truth = desgaste, estimate = .pred_class, event_level = "second"),
+  roc_auc(pred_final, truth = desgaste, .pred_Si, event_level = "second")
+) %>% 
+  select(.metric, .estimate) %>% 
+  mutate(.estimate = round(.estimate, 3))
+```
+
+### Importancia por permutación
+
+La red no tiene una medida propia de importancia de variables, pero podemos estimarla desde afuera del modelo: desordenamos una variable en el set de test, volvemos a predecir y medimos cuánto baja el AUC. Si baja mucho, esa variable era importante para el modelo. Este procedimiento sirve para cualquier modelo.
+
+```{r}
+auc_base <- roc_auc(pred_red, truth = desgaste, .pred_Si,
+                    event_level = "second")$.estimate
+
+permutar_una <- function(variable, repeticiones = 5) {
+  caidas <- map_dbl(seq_len(repeticiones), function(i) {
+    set.seed(i)
+    test_perm <- test
+    test_perm[[variable]] <- sample(test_perm[[variable]])
+    auc_perm <- augment(red_fit, test_perm) %>% 
+      roc_auc(truth = desgaste, .pred_Si, event_level = "second") %>% 
+      pull(.estimate)
+    auc_base - auc_perm
+  })
+  mean(caidas)
+}
+
+candidatas <- c("horas_extra", "anios_trabajados", "edad", "ingreso_mensual",
+                "satisfaccion_trabajo", "involucramiento_trabajo",
+                "distancia_hogar", "anios_ultpuesto", "estado_civil", "turno")
+
+importancia <- tibble(
+  variable   = candidatas,
+  caida_auc  = map_dbl(candidatas, permutar_una)
+) %>% 
+  arrange(desc(caida_auc))
+
+importancia
+```
+
+```{r fig.width=7, fig.height=4}
+importancia %>% 
+  mutate(variable = fct_reorder(variable, caida_auc)) %>% 
+  ggplot(aes(x = caida_auc, y = variable)) +
+  geom_col(fill = "#4285F4") +
+  labs(title = "Importancia por permutación (red neuronal)",
+       subtitle = "Caída del ROC AUC al desordenar cada variable",
+       x = "caída del AUC", y = NULL) +
+  theme_minimal()
+```
+
+Comparemos con la importancia que calcula `ranger` para el random forest (también por permutación):
+
+```{r fig.width=7, fig.height=4}
+library(vip)
+
+set.seed(1912)
+rf_fit <- workflow() %>% 
+  add_recipe(receta_red) %>% 
+  add_model(rand_forest(trees = 500) %>% 
+              set_engine("ranger", importance = "permutation", seed = 1912) %>% 
+              set_mode("classification")) %>% 
+  fit(train)
+
+extract_fit_parsnip(rf_fit) %>% vip(num_features = 10, geom = "col")
+```
+
+> **Para cerrar:** ¿coinciden los rankings? Si una variable aparece arriba en los dos, es más probable que sea importante en sí misma y no por cómo funciona un modelo en particular. Si no coinciden, una posible explicación es que haya variables correlacionadas entre sí y cada modelo se apoye en una distinta.

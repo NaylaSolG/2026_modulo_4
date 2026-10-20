@@ -1,0 +1,137 @@
+---
+title: "Clase 6 - Redes Neuronales Artificiales"
+subtitle: "Práctica independiente"
+author: 
+  - Diplomatura en Ciencias Sociales Computacionales y Humanidades Digitales (IDAES-UNSAM)
+  - Módulo 4 - Fundamentos de Machine Learning
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float:
+      toc_collapsed: false
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(nnet)
+```
+
+## El problema
+
+Volvemos al dataset de desgaste laboral en un hospital que usaron en la clase 2 (`desgaste_salud.RDS`, tomado de [Kaggle](https://www.kaggle.com/datasets/jpmiller/employee-attrition-for-healthcare)). La idea es predecir si un/a trabajador/a tiene propensión a dejar el puesto por desgaste laboral.
+
+```{r}
+datos <- readRDS("./data/desgaste_salud.RDS")
+
+dim(datos)
+table(datos$desgaste)
+```
+
+La variable a predecir es `desgaste`. Está muy desbalanceada: alrededor del 12% de los casos son positivos.
+
+La categoría positiva lleva tilde ("Sí"), lo que complica escribir el nombre de la columna de probabilidades que genera el modelo (`.pred_Sí`). Para evitarlo, la recodificamos:
+
+```{r}
+datos <- datos %>% 
+  mutate(desgaste = factor(if_else(desgaste == "No", "No", "Si"),
+                           levels = c("No", "Si")))
+
+levels(datos$desgaste)
+```
+
+## La consigna
+
+El objetivo es entrenar una red neuronal con estos datos y compararla con el random forest que armaron en la clase 2.
+
+### 1. Exploración previa
+
+- ¿Cuántas variables son numéricas y cuántas categóricas? ¿Cuántas columnas van a quedar después de `step_dummy()`?
+- Hay al menos tres variables constantes (toman siempre el mismo valor). ¿Cuáles son? ¿Por qué conviene sacarlas antes de entrenar una red?
+
+```{r}
+# Pista: 
+# sapply(datos, function(x) length(unique(x)))
+```
+
+### 2. Partición
+
+Hagan la partición train/test estratificando por `desgaste`. Con clases tan desbalanceadas, si no estratificamos pueden quedar muy pocos casos positivos en test.
+
+```{r}
+
+```
+
+### 3. La receta
+
+Armen la receta teniendo en cuenta los pasos que necesita una red y que no hacían falta para los árboles:
+
+- `update_role()` para el ID.
+- `step_zv()` para las variables constantes.
+- `step_other()` para agrupar categorías chicas.
+- `step_dummy()` para las categóricas.
+- `step_normalize()` para las numéricas.
+- Algún paso para tratar el desbalance. Pueden usar `step_downsample()`, como en la clase 1, o probar `step_smote()`, que en lugar de eliminar casos de la clase mayoritaria genera casos sintéticos de la minoritaria.
+
+Antes de seguir, apliquen la receta con `prep()` y `bake()` y revisen cuántas predictoras quedaron.
+
+```{r}
+
+```
+
+### 4. El modelo
+
+Especifiquen una red con `mlp()`. Pueden empezar con una red chica (8 neuronas). Recuerden:
+
+- `set_engine("nnet", trace = FALSE)`.
+- Si la red es grande, hay que subir `MaxNWts`.
+
+```{r}
+
+```
+
+### 5. Ajuste y evaluación
+
+Entrenen el modelo y evalúenlo en test. Tengan en cuenta que las clases están desbalanceadas:
+
+- La *accuracy* no es muy informativa en este caso: un modelo que prediga siempre "No" acierta el 88% de las veces.
+- Conviene mirar sobre todo el recall (qué proporción de los casos reales de desgaste detecta el modelo) y el ROC AUC.
+- Como la clase de interés es la segunda (`Si`), hay que indicarlo en `yardstick` con `event_level = "second"`.
+
+```{r}
+# Pista para las métricas:
+# metricas <- metric_set(accuracy, precision, recall, f_meas)
+# metricas(pred, truth = desgaste, estimate = .pred_class, event_level = "second")
+# roc_auc(pred, truth = desgaste, .pred_Si, event_level = "second")
+```
+
+### 6. La comparación
+
+Entrenen un random forest sobre los mismos datos y comparen los resultados.
+
+El random forest no necesita dummies ni normalización. Sin embargo, si usan `step_smote()`, las dummies son necesarias igual, porque SMOTE calcula distancias entre casos y para eso todas las variables tienen que ser numéricas. Lo más simple es usar la misma receta para los dos modelos: la normalización no afecta al random forest, porque los cortes de un árbol no cambian si se reescala una variable.
+
+```{r}
+
+```
+
+### 7. Preguntas
+
+Respondan a partir de los resultados que obtuvieron:
+
+- ¿Qué modelo eligen y por qué? ¿Cambia la respuesta según la métrica que miren?
+- La red y el random forest pueden tener un ROC AUC parecido pero un recall muy distinto. ¿Qué significa eso en este problema? Si el hospital usara el modelo para decidir a quién ofrecer acciones de prevención, ¿qué error sería más costoso: un falso positivo o un falso negativo?
+- En la ENUT, el random forest funcionaba mejor que la red. ¿Pasa lo mismo acá? ¿Qué diferencias entre las dos bases podrían explicarlo?
+
+### 8. Para quien quiera seguir
+
+- Ajusten `hidden_units` y `penalty` con `tune_grid()` y cross-validation (alcanza con 5 folds). ¿Cuánto mejora respecto de la red elegida a mano?
+- Prueben `step_downsample()` en lugar de `step_smote()`. ¿Cambia el recall?
+- La red no tiene una medida propia de importancia de variables, pero se puede estimar la importancia por permutación: se desordena una variable, se vuelve a predecir y se mide cuánto empeora el AUC. Calcúlenla para las 5 variables que el random forest marca como más importantes con `vip()`. ¿Coinciden?

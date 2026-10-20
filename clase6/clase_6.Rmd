@@ -1,0 +1,537 @@
+---
+title: "Clase 6 - Redes Neuronales Artificiales"
+subtitle: "Práctica guiada"
+author: 
+  - Diplomatura en Ciencias Sociales Computacionales y Humanidades Digitales (IDAES-UNSAM)
+  - Módulo 4 - Fundamentos de Machine Learning
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::readthedown
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      collapse = TRUE, highlight = TRUE, paged.print = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(themis)   # para balancear clases
+library(nnet)     # el motor de redes que vamos a usar
+```
+
+## Bibliografía de esta clase
+
+- James, G.; Witten, D.; Hastie, T. y Tibshirani, R. (2021). *An Introduction to Statistical Learning*, 2ª ed. New York: Springer. **Cap. 10** (Deep Learning). [Descarga gratuita del libro](https://www.statlearning.com/).
+- Kuhn, M. y Silge, J. (2022). *Tidy Modeling with R*. Sebastopol: O'Reilly. Caps. 12 y 13 (tuneo de hiperparámetros y búsqueda en grilla). [Versión online](https://www.tmwr.org/).
+- Molnar, C. (2025). *Interpretable Machine Learning*, 3ª ed. Caps. 14, 17, 18 y 23 (LIME, Shapley, SHAP e importancia por permutación). [Versión online](https://christophm.github.io/interpretable-ml-book/).
+
+## Introducción
+
+En la clase teórica vimos que cada neurona de una red hace una cuenta muy parecida a la de una regresión logística, y que la red se arma conectando muchas neuronas en capas. En esta práctica vamos a:
+
+1. Entrenar una red sobre la ENUT 2021 para predecir si una persona realiza trabajo doméstico, y compararla con los modelos de las clases anteriores sobre los mismos datos.
+2. Usar una red para clasificar dígitos escritos a mano a partir de los píxeles de cada imagen, un tipo de problema en el que los árboles no funcionan tan bien.
+3. (Opcional) Ver con el motor `brulee` cómo evoluciona el entrenamiento época por época.
+
+Más que ver si la red gana o pierde, la idea es identificar qué pasos nuevos aparecen al trabajar con redes y en qué casos conviene usarlas.
+
+---
+
+# Parte 1: una red sobre la ENUT
+
+## El problema (el mismo de las clases 1 a 3)
+
+Vamos a predecir si las personas realizan trabajo doméstico en el hogar (más de 60 minutos en el día) en base al sexo, la edad, la condición de actividad, el nivel educativo, la relación con el/la jefe/a de hogar, la cantidad de demandantes y no demandantes de cuidado del hogar, y si esa persona es demandante de cuidado.
+
+Usamos el mismo problema para poder comparar los resultados con los que obtuvimos con árboles y ensambles.
+
+## Importación y preprocesamiento
+
+El preprocesamiento es idéntico al de la clase 1:
+
+```{r}
+data <- read_delim("./data/enut2021_base.txt", delim = "|", show_col_types = FALSE)
+
+data <- data %>% 
+  select(ID, SEXO_SEL, EDAD_SEL, TCS_GRUPO_DOMESTICO, CONDICION_ACTIVIDAD_AGRUPADA,   
+         NIVEL_EDUCATIVO_AGRUPADO, CANT_DEMANDANTES_TOTAL, CANT_NODEMANDANTES_TOTAL,
+         BHCH04_SEL, BHDC_SEL) %>% 
+  mutate(realiza_domest = as.factor(case_when(
+    TCS_GRUPO_DOMESTICO > 60 ~ "Realiza",
+    TRUE                     ~ "No realiza")))
+
+data <- data %>% 
+  mutate(
+    SEXO_SEL = as.factor(case_when(SEXO_SEL == 1 ~ "Mujer",
+                                   SEXO_SEL == 2 ~ "Varon")),
+    CONDICION_ACTIVIDAD_AGRUPADA = as.factor(case_when(
+      CONDICION_ACTIVIDAD_AGRUPADA == 1 ~ "Ocupado",
+      CONDICION_ACTIVIDAD_AGRUPADA == 2 ~ "No ocupado")),
+    BHDC_SEL = as.factor(case_when(BHDC_SEL == 0 ~ "No demandante",
+                                   BHDC_SEL == 1 ~ "Demandante")),
+    BHCH04_SEL               = as.factor(BHCH04_SEL),
+    NIVEL_EDUCATIVO_AGRUPADO = as.factor(NIVEL_EDUCATIVO_AGRUPADO)
+  ) %>% 
+  select(-TCS_GRUPO_DOMESTICO)
+
+summary(data$realiza_domest)
+```
+
+Como ya vimos en clases anteriores, la muestra está desbalanceada: hay más casos que realizan trabajo doméstico que casos que no.
+
+## Partición train/test
+
+```{r}
+set.seed(1912)
+
+split <- initial_split(data, strata = realiza_domest)
+train <- training(split)
+test  <- testing(split)
+
+c(train = nrow(train), test = nrow(test))
+```
+
+## La receta
+
+En este paso aparecen las principales diferencias con los árboles. Un árbol puede trabajar directamente con una variable categórica, como la relación con el jefe/a de hogar, y no le afecta que la edad vaya de 18 a 90 mientras la cantidad de demandantes va de 0 a 6. Una red, en cambio, solo trabaja con números, así que la receta necesita dos pasos más:
+
+- `step_dummy()`: convierte cada categoría en una variable binaria (0/1).
+- `step_normalize()`: lleva todas las variables numéricas a la misma escala (media 0 y desvío 1). Si no lo hacemos, las variables con valores más grandes dominan el ajuste de los pesos y el entrenamiento se vuelve lento e inestable.
+
+Además, la red no admite valores faltantes, así que los imputamos antes.
+
+```{r}
+receta <- recipe(realiza_domest ~ ., data = train) %>%
+  update_role(ID, new_role = "id") %>%
+  step_impute_mode(all_nominal_predictors()) %>%     # faltantes en categóricas
+  step_impute_median(all_numeric_predictors()) %>%   # faltantes en numéricas
+  step_other(BHCH04_SEL, threshold = 0.05) %>%       # agrupa categorías chicas
+  step_dummy(all_nominal_predictors()) %>%           # NUEVO: dummies
+  step_normalize(all_numeric_predictors()) %>%       # NUEVO: escalar
+  step_downsample(realiza_domest, under_ratio = 1)   # balancear clases
+
+receta
+```
+
+Antes de modelar, conviene revisar qué devuelve la receta:
+
+```{r}
+horneada <- bake(prep(receta), new_data = NULL)
+
+cat("Cantidad de variables predictoras:", ncol(horneada) - 2, "\n")
+names(horneada)
+```
+
+Las 9 variables originales se convirtieron en 13 predictoras, porque cada categoría pasó a ser una columna. Esto importa porque la cantidad de pesos de la red depende de la cantidad de predictoras:
+
+$$\text{pesos} = (\text{predictoras} \times \text{neuronas}) + \text{neuronas} + (\text{neuronas} \times \text{salidas}) + \text{salidas}$$
+
+Con 13 predictoras y 8 neuronas ocultas, la red tiene $(13 \times 8) + 8 + (8 \times 1) + 1 = 121$ pesos para estimar.
+
+## La especificación del modelo
+
+En `tidymodels` las redes se especifican con `mlp()` (*multilayer perceptron*), de la misma manera que usábamos `decision_tree()` o `rand_forest()`:
+
+```{r}
+red_spec <- mlp(
+  hidden_units = 8,      # neuronas en la capa oculta
+  penalty      = 0.01,   # weight decay: es Ridge sobre los pesos de la red
+  epochs       = 200     # cuántas pasadas por los datos
+) %>%
+  set_engine("nnet", trace = FALSE) %>%
+  set_mode("classification")
+
+red_spec %>% translate()
+```
+
+Con `translate()` vemos a qué función se traduce: `nnet::nnet()`, con los argumentos `size`, `decay` y `maxit`. En `parsnip` los argumentos se llaman igual para todos los motores, y el paquete se encarga de traducirlos.
+
+Algunas particularidades de `nnet`:
+
+- Admite una sola capa oculta. Para redes con más capas hace falta `brulee` o `keras`.
+- No permite elegir el *learning rate*: usa un método de optimización (BFGS) que lo ajusta solo.
+- Tiene un límite de pesos (`MaxNWts`, por defecto 1000). Si la red es más grande, hay que subirlo en `set_engine()`.
+
+## El workflow y el ajuste
+
+```{r}
+red_wf <- workflow() %>%
+  add_recipe(receta) %>%
+  add_model(red_spec)
+
+set.seed(1912)
+red_fit <- red_wf %>% fit(train)
+
+red_fit
+```
+
+## Evaluación
+
+```{r}
+pred <- augment(red_fit, test)
+
+metricas <- metric_set(accuracy, precision, recall, f_meas)
+
+metricas(pred, truth = realiza_domest, estimate = .pred_class)
+```
+
+```{r}
+roc_auc(pred, truth = realiza_domest, `.pred_No realiza`)
+```
+
+```{r}
+conf_mat(pred, truth = realiza_domest, estimate = .pred_class)
+```
+
+```{r}
+pred %>% 
+  roc_curve(truth = realiza_domest, `.pred_No realiza`) %>% 
+  autoplot()
+```
+
+## Comparación con los modelos de las clases anteriores
+
+Ahora entrenamos sobre la misma partición un árbol, un random forest, una regresión logística y dos redes, y comparamos las métricas en test.
+
+Los árboles usan una receta distinta, sin dummies ni normalización, porque no las necesitan.
+
+```{r}
+receta_arboles <- recipe(realiza_domest ~ ., data = train) %>%
+  update_role(ID, new_role = "id") %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_other(BHCH04_SEL, threshold = 0.05) %>%
+  step_downsample(realiza_domest, under_ratio = 1)
+
+evaluar <- function(nombre, spec, rec) {
+  set.seed(1912)
+  fit <- workflow() %>% add_recipe(rec) %>% add_model(spec) %>% fit(train)
+  p   <- augment(fit, test)
+  bind_rows(
+    metricas(p, truth = realiza_domest, estimate = .pred_class),
+    roc_auc(p, truth = realiza_domest, `.pred_No realiza`)
+  ) %>% 
+    select(.metric, .estimate) %>% 
+    mutate(modelo = nombre)
+}
+
+comparacion <- bind_rows(
+  evaluar("Árbol de decisión",
+          decision_tree(tree_depth = 6, min_n = 20) %>% 
+            set_engine("rpart") %>% set_mode("classification"),
+          receta_arboles),
+  evaluar("Random Forest",
+          rand_forest(trees = 500, min_n = 10) %>% 
+            set_engine("ranger", seed = 1912) %>% set_mode("classification"),
+          receta_arboles),
+  evaluar("Regresión logística",
+          logistic_reg() %>% set_engine("glm") %>% set_mode("classification"),
+          receta),
+  evaluar("Red neuronal (8 neuronas)",
+          mlp(hidden_units = 8, penalty = 0.01, epochs = 200) %>% 
+            set_engine("nnet", trace = FALSE) %>% set_mode("classification"),
+          receta),
+  evaluar("Red neuronal (32 neuronas)",
+          mlp(hidden_units = 32, penalty = 0.01, epochs = 300) %>% 
+            set_engine("nnet", trace = FALSE, MaxNWts = 5000) %>% set_mode("classification"),
+          receta)
+)
+
+comparacion %>% 
+  pivot_wider(names_from = .metric, values_from = .estimate) %>% 
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+```
+
+Algunas cosas para observar en la tabla:
+
+- La red de 8 neuronas obtiene resultados muy parecidos a los de la regresión logística y el random forest.
+- La red de 32 neuronas funciona peor que la de 8. Con unos 10.700 casos de entrenamiento, agregar neuronas no mejora el modelo y aumenta el sobreajuste.
+- El random forest tiene el mejor ROC AUC, y no necesita dummies ni normalización.
+
+Este resultado es habitual en datos tabulares como los de una encuesta: los ensambles de árboles suelen ser difíciles de superar.
+
+> **Para discutir:** ¿por qué la red no saca ventaja en este problema? ¿Qué características tendrían que tener los datos para que sí la saque?
+
+## Buscando mejores hiperparámetros con cross-validation
+
+Hasta acá elegimos los hiperparámetros de la red a mano. Para que la comparación sea más justa, los ajustamos con cross-validation sobre una grilla, como hicimos con los otros modelos.
+
+```{r}
+red_tune <- mlp(
+  hidden_units = tune(),
+  penalty      = tune(),
+  epochs       = 200
+) %>%
+  set_engine("nnet", trace = FALSE, MaxNWts = 5000) %>%
+  set_mode("classification")
+
+grilla <- grid_regular(
+  hidden_units(range = c(2, 24)),
+  penalty(range = c(-3, 0)),   # ojo: penalty está en escala log10
+  levels = 4
+)
+
+grilla
+```
+
+```{r}
+set.seed(111)
+folds <- vfold_cv(train, v = 5, strata = realiza_domest)
+
+set.seed(345)
+red_rs <- workflow() %>% 
+  add_recipe(receta) %>% 
+  add_model(red_tune) %>% 
+  tune_grid(
+    resamples = folds,
+    grid      = grilla,
+    metrics   = metric_set(roc_auc, f_meas)
+  )
+
+collect_metrics(red_rs) %>% 
+  filter(.metric == "roc_auc") %>% 
+  arrange(desc(mean)) %>% 
+  head(8)
+```
+
+```{r}
+autoplot(red_rs)
+```
+
+```{r}
+show_best(red_rs, metric = "roc_auc", n = 5)
+```
+
+```{r}
+mejor <- select_best(red_rs, metric = "roc_auc")
+
+red_final <- finalize_workflow(
+  workflow() %>% add_recipe(receta) %>% add_model(red_tune),
+  mejor
+)
+
+set.seed(1912)
+fit_final <- red_final %>% fit(train)
+
+pred_final <- augment(fit_final, test)
+
+bind_rows(
+  metricas(pred_final, truth = realiza_domest, estimate = .pred_class),
+  roc_auc(pred_final, truth = realiza_domest, `.pred_No realiza`)
+) %>% 
+  select(.metric, .estimate) %>% 
+  mutate(.estimate = round(.estimate, 3))
+```
+
+> **Para pensar:** ¿cuánto mejoró respecto de la red que armamos a mano? Si la mejora es chica, ¿justifica el tiempo de cómputo?
+
+---
+
+# Parte 2: clasificar imágenes
+
+En la ENUT la red no mostró ventajas. Veamos ahora un problema con imágenes.
+
+Vamos a trabajar con una muestra del dataset MNIST de dígitos escritos a mano: 3.000 imágenes para entrenar y 1.000 para evaluar. Cada imagen tiene 28 × 28 píxeles, y cada píxel es un número entre 0 (blanco) y 255 (negro). Por lo tanto, tenemos 784 variables predictoras (una por píxel) y una variable a predecir con 10 clases (los dígitos del 0 al 9).
+
+```{r}
+train_dig <- read_csv("./data/digitos_train.csv.gz", show_col_types = FALSE) %>% 
+  mutate(digito = factor(digito))
+
+test_dig <- read_csv("./data/digitos_test.csv.gz", show_col_types = FALSE) %>% 
+  mutate(digito = factor(digito))
+
+dim(train_dig)
+table(train_dig$digito)
+```
+
+## Veamos los datos
+
+Para graficar una imagen tenemos que pasar de una fila de 784 números a una grilla de 28 × 28:
+
+```{r fig.width=8, fig.height=3.5}
+ver_digitos <- function(datos, n = 20) {
+  datos %>% 
+    head(n) %>% 
+    mutate(caso = row_number()) %>% 
+    pivot_longer(starts_with("px"), names_to = "px", values_to = "valor") %>% 
+    mutate(
+      pos = as.integer(str_remove(px, "px")),
+      x   = (pos - 1) %%  28,
+      y   = (pos - 1) %/% 28
+    ) %>% 
+    ggplot(aes(x = x, y = -y, fill = valor)) +
+    geom_raster() +
+    facet_wrap(~ paste("dígito:", digito), nrow = 2) +
+    scale_fill_gradient(low = "white", high = "black", guide = "none") +
+    coord_equal() +
+    theme_void() +
+    theme(strip.text = element_text(size = 8))
+}
+
+ver_digitos(train_dig, 20)
+```
+
+Para el modelo, cada imagen es una fila con 784 columnas. Ninguno de los modelos que vimos tiene en cuenta que se trata de una imagen.
+
+## Reducción de dimensionalidad con PCA
+
+Si entrenamos `nnet` directamente sobre los 784 píxeles, el ajuste tarda más de un minuto y los resultados son peores. Son muchas variables, y buena parte vale casi siempre cero (los bordes de la imagen).
+
+Una alternativa es usar lo que vimos en la clase 4: reducir primero la dimensionalidad con PCA. Pasamos de 784 píxeles a 50 componentes principales y entrenamos la red sobre esas 50 variables.
+
+```{r}
+receta_dig <- recipe(digito ~ ., data = train_dig) %>%
+  step_zv(all_predictors()) %>%                              # saca píxeles siempre iguales
+  step_normalize(all_numeric_predictors()) %>%               # el PCA necesita variables escaladas
+  step_pca(all_numeric_predictors(), num_comp = 50)          # 784 -> 50
+
+receta_dig
+```
+
+Es decir, el PCA no sirve solo para explorar o visualizar datos: también puede ser un paso de preprocesamiento antes de un modelo supervisado.
+
+```{r}
+red_dig <- mlp(hidden_units = 50, penalty = 0.001, epochs = 300) %>%
+  set_engine("nnet", MaxNWts = 8000, trace = FALSE) %>%
+  set_mode("classification")
+
+set.seed(1912)
+fit_dig <- workflow() %>% 
+  add_recipe(receta_dig) %>% 
+  add_model(red_dig) %>% 
+  fit(train_dig)
+```
+
+En este caso la red tiene 10 neuronas de salida (una por dígito) con activación *softmax*, en lugar de una sola con sigmoide. Esto se define automáticamente a partir de los niveles del factor.
+
+```{r}
+pred_dig <- augment(fit_dig, test_dig)
+
+accuracy(pred_dig, truth = digito, estimate = .pred_class)
+```
+
+## Comparación con árboles
+
+```{r}
+comparar_dig <- function(nombre, spec) {
+  t0 <- Sys.time()
+  set.seed(1912)
+  fit <- workflow() %>% add_recipe(receta_dig) %>% add_model(spec) %>% fit(train_dig)
+  seg <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  acc <- accuracy(augment(fit, test_dig), truth = digito, estimate = .pred_class)$.estimate
+  tibble(modelo = nombre, accuracy = round(acc, 3), segundos = round(seg, 1))
+}
+
+bind_rows(
+  comparar_dig("Árbol de decisión",
+               decision_tree(tree_depth = 12) %>% 
+                 set_engine("rpart") %>% set_mode("classification")),
+  comparar_dig("Random Forest (500)",
+               rand_forest(trees = 500) %>% 
+                 set_engine("ranger", seed = 1912) %>% set_mode("classification")),
+  comparar_dig("Red neuronal (50 neuronas)",
+               red_dig)
+)
+```
+
+El árbol simple funciona mucho peor que los otros dos modelos. Un árbol toma decisiones preguntando si una variable es mayor o menor que un valor, y en este problema ninguna variable (ni píxel ni componente) separa bien las clases por sí sola.
+
+La red y el random forest dan resultados parecidos; con solo 3.000 casos de entrenamiento la diferencia es chica. En imágenes, los mejores resultados se obtienen con redes convolucionales, que tienen en cuenta que los píxeles vecinos están relacionados: con el MNIST completo (60.000 casos) superan el 99% de accuracy.
+
+## ¿En qué se equivoca la red?
+
+```{r}
+conf_mat(pred_dig, truth = digito, estimate = .pred_class)
+```
+
+```{r}
+pred_dig %>% 
+  filter(digito != .pred_class) %>% 
+  count(digito, .pred_class, sort = TRUE) %>% 
+  head(10)
+```
+
+También podemos mirar algunos de los casos mal clasificados:
+
+```{r fig.width=8, fig.height=3.5}
+pred_dig %>% 
+  filter(digito != .pred_class) %>% 
+  mutate(digito = paste0(digito, " leído como ", .pred_class)) %>% 
+  ver_digitos(10)
+```
+
+> **Para discutir:** ¿les parecen errores razonables? ¿Ustedes también dudarían con alguna de esas imágenes?
+
+---
+
+# Parte 3 (opcional): ver el entrenamiento por dentro con `brulee`
+
+`nnet` no muestra cómo evoluciona el entrenamiento ni permite elegir el learning rate. El motor `brulee`, basado en `torch`, permite ambas cosas y además admite varias capas ocultas.
+
+Su desventaja es la instalación: `torch` es una descarga grande y a veces da problemas. Por eso estos bloques no se ejecutan al compilar el documento; quedan para que los prueben en sus computadoras.
+
+```{r eval=FALSE}
+install.packages("brulee")
+library(brulee)
+```
+
+```{r eval=FALSE}
+red_brulee <- mlp(
+  hidden_units = c(16, 8),    # dos capas ocultas (nnet admite una sola)
+  penalty      = 0.001,
+  epochs       = 150,
+  learn_rate   = 0.05,        # learning rate
+  activation   = "relu"
+) %>%
+  set_engine("brulee", 
+             validation = 0.2,      # aparta 20% para monitorear
+             stop_iter  = 10) %>%   # early stopping: corta si no mejora en 10 épocas
+  set_mode("classification")
+
+set.seed(1912)
+fit_brulee <- workflow() %>% 
+  add_recipe(receta) %>% 
+  add_model(red_brulee) %>% 
+  fit(train)
+```
+
+`brulee` guarda la pérdida de cada época, así que podemos graficar la curva de entrenamiento que vimos en la teórica:
+
+```{r eval=FALSE}
+autoplot(extract_fit_engine(fit_brulee))
+```
+
+```{r eval=FALSE}
+# ¿en qué época cortó el early stopping?
+extract_fit_engine(fit_brulee)$best_epoch
+```
+
+Algunas pruebas para hacer, cambiando una cosa por vez:
+
+- `learn_rate = 0.5` y `learn_rate = 0.001`. ¿Qué le pasa a la curva?
+- Sacar `stop_iter` y subir `epochs` a 500. ¿Se separa la curva de validación de la de entrenamiento?
+- `hidden_units = c(64, 32, 16)`. ¿Mejora el AUC en test o solo el de entrenamiento?
+
+---
+
+# Cierre: ¿cuándo conviene usar una red neuronal?
+
+En general, no suele ser la mejor opción cuando:
+
+- Los datos son tabulares (una encuesta, un registro administrativo) y la cantidad de casos no es muy grande. Un random forest o un boosting suelen rendir igual o mejor, con menos preparación.
+- Hay que explicar el modelo o justificar decisiones que afectan a personas. La red no tiene reglas legibles ni una medida propia de importancia de variables.
+- El tiempo de cómputo es limitado: ajustar los hiperparámetros de una red lleva tiempo.
+
+Puede ser una buena opción cuando:
+
+- Los datos tienen una estructura que alguna arquitectura aprovecha: imágenes (redes convolucionales), texto o series de tiempo (redes recurrentes, transformers).
+- Hay muchos casos de entrenamiento.
+- El objetivo es solo predecir y la interpretabilidad no es un requisito.
+
+En cualquier caso, conviene comparar siempre con un modelo más simple. Si una regresión logística da resultados parecidos, es preferible quedarse con la regresión logística.
+
+## Para seguir jugando
+
+[A Neural Network Playground](https://playground.tensorflow.org/) permite modificar neuronas, capas, learning rate y funciones de activación y ver cómo cambia la frontera de decisión. Es útil para ganar intuición sobre lo que vimos en la teórica.
